@@ -1,0 +1,8 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.env
+rag.db
+chroma_db/
+data/*.pdf
