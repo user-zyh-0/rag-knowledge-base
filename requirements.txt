@@ -1,0 +1,10 @@
+# 大模型 / Embedding 调用
+openai==3.24.0
+
+# 环境变量加载
+python-dotenv==1.2.4
+
+# 数据库：ORM + 驱动 + MySQL 8 认证
+SQLAlchemy==2.1.4
+PyMySQL==1.2.3
+cryptography==50.0.2
