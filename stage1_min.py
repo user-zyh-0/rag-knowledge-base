@@ -2,10 +2,10 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 
-import json
-import sqlite3
+from sqlalchemy import create_engine, Column, String, Text, LargeBinary
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-DB_PATH = "./rag.db"
+import json
 
 load_dotenv(override=True)
 
@@ -20,7 +20,18 @@ llm_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL")
 )
+MYSQL_URL = os.getenv("MYSQL_URL")
+engine = create_engine(MYSQL_URL, echo=True)
 
+Base = declarative_base()
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    id = Column(String(64), primary_key=True)
+    content = Column(Text, nullable=False)
+    vector = Column(LargeBinary, nullable=False)
+
+Session = sessionmaker(bind=engine)
 
 def cosine(a,b):
     dot = 0.0
@@ -51,42 +62,34 @@ def embed(texts):
 
 
 def build_index(chunks,vecs):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DROP TABLE IF EXISTS chunks")
-    cursor.execute("CREATE TABLE chunks ("
-                   "id TEXT PRIMARY KEY , "
-                   "content TEXT NOT NULL , "
-                   "vector BLOB NOT NULL )")
-    rows = [
-        (f"chunk_{i}", chunk, json.dumps(vec).encode("utf-8"))
-        for i, (chunk, vec) in enumerate(zip(chunks, vecs))
-    ]
+    Base.metadata.create_all(engine)
 
-    conn.executemany(
-        "INSERT INTO chunks (id, content, vector) VALUES (?, ?, ?)",
-        rows,
-    )
-    conn.commit()
-    conn.close()
-    return len(rows)
+    with Session() as session:
+        session.query(Chunk).delete()
+
+        rows = [
+            Chunk(id=f"chunk_{i}",content=chunk,vector=json.dumps(vec).encode("utf-8"))
+            for i, (chunk, vec) in enumerate(zip(chunks, vecs))
+        ]
+        session.add_all(rows)
+
+        session.commit()
+        return len(rows)
 
 
 def retrieve(question, k = 3):
     qvec = embed([question])[0]
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    rows = cursor.execute("SELECT id, content, vector FROM chunks").fetchall()
-    conn.close()
+    with Session() as session:
+        rows = session.query(Chunk).all()
 
-    scored = []
-    for cid, content, blob in rows:
-        vec = json.loads(blob.decode("utf-8"))
-        scored.append((cosine(qvec, vec), cid, content))
+        scored = []
+        for c in rows:
+            vec = json.loads(c.vector.decode("utf-8"))
+            scored.append((cosine(qvec, vec), c.id, c.content))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:k]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:k]
 
 
 def ask(question, k=3):
@@ -98,13 +101,13 @@ def ask(question, k=3):
         context += f"【资料{i}】{content}\n"
 
     prompt = f"""请根据以下资料回答问题，只使用资料中的信息，不要编造。
-    如果资料中没有相关内容，请回答"资料中没有提到"。
+如果资料中没有相关内容，请回答"资料中没有提到"。
 
-    资料：
-    {context}
-    
-    问题：{question}
-    """
+资料：
+{context}
+
+问题：{question}
+"""
 
     resp = llm_client.chat.completions.create(
         model=LLM_MODEL,
@@ -131,22 +134,24 @@ if __name__ == '__main__':
     # print("库里条数 =", n)
     # print("块数=", len(chunks))
 
-    # for q in ["切块长度和重叠分别设为多少？",
-    #           "相似度阈值设的是多少？",
-    #           "ZQ41-RAG-DEMO-2026 这个编号在哪？",
-    #           "每天建议喝多少水？"]:
-    #     print(f"\n【问】{q}")
-    #     for score, cid, content in retrieve(q, k=3):
-    #         print(f"  {score:.4f}  {cid}  {content[:35]}")
-
-    print("\n" + "=" * 60)
-    print("【ask 测试】")
-    print("=" * 60)
     for q in ["切块长度和重叠分别设为多少？",
               "相似度阈值设的是多少？",
-              "红烧肉怎么做？"]:
+              "ZQ41-RAG-DEMO-2026 这个编号在哪？",
+              "每天建议喝多少水？"]:
         print(f"\n【问】{q}")
-        print(f"【答】{ask(q)}")
+        for score, cid, content in retrieve(q, k=3):
+            print(f"  {score:.4f}  {cid}  {content[:35]}")
+
+    # print("\n" + "=" * 60)
+    # print("【ask 测试】")
+    # print("=" * 60)
+    # for q in ["切块长度和重叠分别设为多少？",
+    #           "相似度阈值设的是多少？",
+    #           "红烧肉怎么做？"]:
+    #     print(f"\n【问】{q}")
+    #     print(f"【答】{ask(q)}")
+
+    # print("建表完成")
 
 
 
