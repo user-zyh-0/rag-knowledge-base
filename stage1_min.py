@@ -2,15 +2,19 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, String, Text, LargeBinary
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import create_engine, Column, String, Text, LargeBinary,Integer,DateTime,ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base,relationship
 
+from datetime import datetime
 import json
 
 load_dotenv(override=True)
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 LLM_MODEL = os.getenv("LLM_MODEL")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 50))
+
 
 emb_client = OpenAI(
     api_key=os.getenv("SILICONFLOW_API_KEY"),
@@ -21,17 +25,31 @@ llm_client = OpenAI(
     base_url=os.getenv("DEEPSEEK_BASE_URL")
 )
 MYSQL_URL = os.getenv("MYSQL_URL")
-engine = create_engine(MYSQL_URL, echo=True)
+engine = create_engine(MYSQL_URL, echo=False)
 
 Base = declarative_base()
 
 class Chunk(Base):
     __tablename__ = "chunks"
     id = Column(String(64), primary_key=True)
+    doc_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"),
+                    nullable=False, index=True)
     content = Column(Text, nullable=False)
     vector = Column(LargeBinary, nullable=False)
 
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    filename = Column(String(255), nullable=False, unique=True)
+    size_bytes = Column(Integer, nullable=False)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    created_at  = Column(DateTime, nullable=False, default=datetime.now)
+
+    chunks = relationship("Chunk", cascade="all, delete-orphan", passive_deletes=True)
+
 Session = sessionmaker(bind=engine)
+
 
 def cosine(a,b):
     dot = 0.0
@@ -42,6 +60,78 @@ def cosine(a,b):
         na += x*x
         nb += y*y
     return dot / ((na ** 0.5)*(nb ** 0.5))
+
+
+def add_document(filename, text):
+    Base.metadata.create_all(engine)
+
+    # 查重
+    with Session() as session:
+        if session.query(Document).filter(Document.filename == filename).first():
+            return None, f"文档已存在: {filename}"
+
+    chunks = split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    vecs = embed(chunks)
+    size_bytes = len(text.encode("utf-8"))
+    created_at = datetime.now()
+
+    with Session() as session:
+        doc = Document(
+            filename=filename,
+            size_bytes=size_bytes,
+            chunk_count=len(chunks),
+            created_at=created_at,
+        )
+        session.add(doc)
+        session.flush()
+        doc_id = doc.id
+
+        session.add_all([
+            Chunk(
+                id=f"{doc_id}_chunk_{i}",
+                doc_id=doc_id,
+                content = c,
+                vector=json.dumps(v).encode("utf-8")
+            )
+            for i, (c, v) in enumerate(zip(chunks, vecs))
+        ])
+        session.commit()
+        return {
+            "id": doc_id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "chunk_count": len(chunks),
+            "created_at": created_at,
+        }, None
+
+
+def list_documents():
+    with Session() as session:
+        rows = session.query(Document).order_by(Document.id).all()
+        return [{
+            "id": r.id,
+            "filename": r.filename,
+            "size_bytes": r.size_bytes,
+            "chunk_count": r.chunk_count,
+            "created_at": r.created_at,
+        } for r in rows]
+
+
+def delete_document(doc_id):
+    with Session() as session:
+        doc = session.get(Document, doc_id)
+        if doc is None:
+            return None, f"文档不存在: id={doc_id}"
+
+        info = {
+            "id": doc.id,
+            "filename": doc.filename,
+            "chunk_count": doc.chunk_count,
+        }
+        session.delete(doc)
+        session.commit()
+        return info, None
+
 
 
 def read_file(path):
@@ -59,22 +149,6 @@ def embed(texts):
         input=texts
     )
     return [item.embedding for item in resp.data]
-
-
-def build_index(chunks,vecs):
-    Base.metadata.create_all(engine)
-
-    with Session() as session:
-        session.query(Chunk).delete()
-
-        rows = [
-            Chunk(id=f"chunk_{i}",content=chunk,vector=json.dumps(vec).encode("utf-8"))
-            for i, (chunk, vec) in enumerate(zip(chunks, vecs))
-        ]
-        session.add_all(rows)
-
-        session.commit()
-        return len(rows)
 
 
 def retrieve(question, k = 3):
@@ -117,42 +191,4 @@ def ask(question, k=3):
 
 
 if __name__ == '__main__':
-    # print(read_file("data/test1.txt"))
-    # chunks = split_text(read_file("data/test1.txt"), 500, 50)
-    # for i, c in enumerate(chunks, 1):
-    #     print(f"[{i}] 长度={len(c)}")
-    #     print(c)
-    #     print("-" * 40)
-
-    # vecs = embed(["番茄炒蛋要大火快炒", "红烧肉要先焯水"])
-    # print(vecs[0],vecs[1],vecs[2])
-
-    # text = read_file("data/test1.txt")
-    # chunks = split_text(text, 500, 50)
-    # vecs = embed(chunks)
-    # n = build_index(chunks, vecs)
-    # print("库里条数 =", n)
-    # print("块数=", len(chunks))
-
-    for q in ["切块长度和重叠分别设为多少？",
-              "相似度阈值设的是多少？",
-              "ZQ41-RAG-DEMO-2026 这个编号在哪？",
-              "每天建议喝多少水？"]:
-        print(f"\n【问】{q}")
-        for score, cid, content in retrieve(q, k=3):
-            print(f"  {score:.4f}  {cid}  {content[:35]}")
-
-    # print("\n" + "=" * 60)
-    # print("【ask 测试】")
-    # print("=" * 60)
-    # for q in ["切块长度和重叠分别设为多少？",
-    #           "相似度阈值设的是多少？",
-    #           "红烧肉怎么做？"]:
-    #     print(f"\n【问】{q}")
-    #     print(f"【答】{ask(q)}")
-
-    # print("建表完成")
-
-
-
-
+    pass
