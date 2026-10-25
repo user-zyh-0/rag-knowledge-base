@@ -190,5 +190,35 @@ def ask(question, k=3):
     return resp.choices[0].message.content
 
 
+def ask_stream(question, k=3):
+    hits = retrieve(question, k)
+    print("  [命中的块]", [cid for _, cid, _ in hits])
+
+    context = ""
+    for i, (score, cid, content) in enumerate(hits, 1):
+        context += f"【资料{i}】{content}\n"
+
+    prompt = f"""请根据以下资料回答问题，只使用资料中的信息，不要编造。
+如果资料中没有相关内容，请回答"资料中没有提到"。
+
+资料：
+{context}
+
+问题：{question}
+"""
+
+    stream = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        if getattr(delta, "reasoning_content", None):
+            yield delta.reasoning_content
+        if delta.content:
+            yield delta.content
+
+
 if __name__ == '__main__':
     pass
