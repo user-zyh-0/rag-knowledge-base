@@ -1,4 +1,5 @@
 import os
+import re
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -67,7 +68,7 @@ def cosine(a,b):
     return dot / ((na ** 0.5)*(nb ** 0.5))
 
 
-def add_document(filename, text):
+def add_document(filename, text, chunker=None):
     Base.metadata.create_all(engine)
 
     # 查重
@@ -75,7 +76,8 @@ def add_document(filename, text):
         if session.query(Document).filter(Document.filename == filename).first():
             return None, f"文档已存在: {filename}"
 
-    chunks = split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    # chunks = split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    chunks = chunker(text) if chunker else split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
     vecs = embed(chunks)
     size_bytes = len(text.encode("utf-8"))
     created_at = datetime.now()
@@ -148,6 +150,49 @@ def split_text(text, size, overlap):
     return [text[i : i + size] for i in range(0, len(text), size - overlap)]
 
 
+def split_by_heading(text, max_size=800):
+    parts = re.split(r"(?=^#{1,3} )", text, flags=re.M)
+    chunks = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) <= max_size:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), max_size):
+                chunks.append(p[i : i + max_size])
+    return chunks
+
+
+def _is_empty_heading(chunk):
+    """判断是不是只有标题和分隔线、没有正文的空壳块"""
+    body = re.sub(r"^#{1,6} .*$", "", chunk, flags=re.M)   # 去掉标题行
+    body = re.sub(r"^=+$", "", body, flags=re.M)           # 去掉 ==== 分隔线
+    return len(body.strip()) < 20
+
+
+def merge_empty_headings(chunks):
+    """把空壳块合并到下一块，保留章节上下文"""
+    merged = []
+    carry = ""
+    for c in chunks:
+        if _is_empty_heading(c):
+            carry += c + "\n"          # 攒起来，等下一块
+        else:
+            merged.append((carry + c).strip())
+            carry = ""
+    if carry:                          # 结尾还有没合并的
+        merged.append(carry.strip())
+    return merged
+
+
+def split_smart(text, size=500, overlap=50):
+    if re.search(r"^#{1,6} ", text, flags=re.M):
+        return merge_empty_headings(split_by_heading(text, max_size=size * 2))
+    return split_text(text, size, overlap)
+
+
 def embed(texts):
     resp = emb_client.embeddings.create(
         model=EMBEDDING_MODEL,
@@ -156,11 +201,15 @@ def embed(texts):
     return [item.embedding for item in resp.data]
 
 
-def retrieve(question, k=3):
+def retrieve(question, k=3, doc_id=None):
     qvec = embed([question])[0]
 
     with Session() as session:
-        rows = session.query(Chunk).all()
+        # rows = session.query(Chunk).all()
+        query = session.query(Chunk)
+        if doc_id is not None:
+            query = query.filter(Chunk.doc_id == doc_id)
+        rows = query.all()
 
         scored = []
         for c in rows:
@@ -176,12 +225,16 @@ def _tokenize(text):
     return [w for w in jieba.lcut_for_search(text) if w.strip()]
 
 
-def bm25_retrieve(question, k=3):
+def bm25_retrieve(question, k=3, doc_id=None):
     k1, b = 1.5,0.75
     q_tokens = _tokenize(question)
 
     with Session() as session:
-        rows = session.query(Chunk).all()
+        query = session.query(Chunk)
+        if doc_id is not None:
+            query = query.filter(Chunk.doc_id == doc_id)
+        rows = query.all()
+
         corpus = [(_tokenize(r.content),r.id,r.content) for r in rows]
     total_docs = len(corpus)
     if total_docs == 0:
@@ -213,12 +266,12 @@ def bm25_retrieve(question, k=3):
     return results[:k]
 
 
-def hybrid_retrieve(question, k=3, pool=10, rrf_k=60):
+def hybrid_retrieve(question, k=3, pool=10, rrf_k=60, doc_id=None):
     # pool 应远小于语料规模（生产 50~100）；本项目仅 10 块，pool=全量，
     # 融合退化为名次平均，区分度有限——机制正确，收益需更大语料才能体现
 
-    vec_hits = retrieve(question, k=pool)
-    bm25_hits = bm25_retrieve(question, k=pool)
+    vec_hits = retrieve(question, k=pool, doc_id=doc_id)
+    bm25_hits = bm25_retrieve(question, k=pool, doc_id=doc_id)
     scores = {}
     contents = {}
     for rank, (_, cid, content) in enumerate(vec_hits, 1):
@@ -326,8 +379,33 @@ def ask_stream(question, k=5):
             yield delta.content
 
 
-if __name__ == '__main__':
-    for q in ["切片切多大合适", "这玩意儿咋配", "top_k 取多少"]:
-        print(f"\n--- {q} ---")
-        print("融合:", [(cid, round(s, 4)) for s, cid, _ in hybrid_retrieve(q, 5)])
-        print("多路:", [(cid, round(s, 4)) for s, cid, _ in multi_retrieve(q, 5)])
+CASES = [
+    ("切片切多大合适",       "chunk_size"),
+    ("top_k 取多少",         "top_k"),
+    ("相似度阈值设多少",     "0.58"),
+    ("数据库主键用什么类型", "INTEGER"),
+    ("怎么防止模型乱编",     "编造"),
+    ("RAG 的完整链路是什么", "向量化"),
+]
+
+
+def hit_rate(doc_id, k=3):
+    """命中率：top-k 结果里有没有含答案关键词"""
+    hits = []
+    for q, kw in CASES:
+        results = hybrid_retrieve(q, k=k, doc_id=doc_id)
+        ok = any(kw in c for _, _, c in results)
+        hits.append(ok)
+    return sum(hits) / len(hits), hits
+
+
+if __name__ == "__main__":
+    text = read_file("data/test1.txt")
+    info, err = add_document("test1_heading.txt", text, chunker=split_smart)
+    print("入库:", info, err)
+
+    for name, did in [("固定长度", 4), ("按标题", info["id"] if info else None)]:
+        if did is None:
+            continue
+        rate, detail = hit_rate(did, k=3)
+        print(f"{name:8s} doc_id={did}  命中率={rate:.0%}  {detail}")
