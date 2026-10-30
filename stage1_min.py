@@ -324,7 +324,7 @@ def multi_retrieve(question, k=5, n = 2):
     return [(score, cid, contents[cid]) for cid, score in ranked[:k]]
 
 def ask(question, k=5):
-    hits= hybrid_retrieve(question, k)
+    hits= multi_retrieve(question, k)
     print("  [命中的块]", [cid for _, cid, _ in hits])
 
     context = ""
@@ -349,7 +349,7 @@ def ask(question, k=5):
 
 
 def ask_stream(question, k=5):
-    hits = hybrid_retrieve(question, k)
+    hits = multi_retrieve(question, k)
     print("  [命中的块]", [cid for _, cid, _ in hits])
 
     context = ""
@@ -379,33 +379,12 @@ def ask_stream(question, k=5):
             yield delta.content
 
 
-CASES = [
-    ("切片切多大合适",       "chunk_size"),
-    ("top_k 取多少",         "top_k"),
-    ("相似度阈值设多少",     "0.58"),
-    ("数据库主键用什么类型", "INTEGER"),
-    ("怎么防止模型乱编",     "编造"),
-    ("RAG 的完整链路是什么", "向量化"),
-]
-
-
-def hit_rate(doc_id, k=3):
-    """命中率：top-k 结果里有没有含答案关键词"""
-    hits = []
-    for q, kw in CASES:
-        results = hybrid_retrieve(q, k=k, doc_id=doc_id)
-        ok = any(kw in c for _, _, c in results)
-        hits.append(ok)
-    return sum(hits) / len(hits), hits
-
-
 if __name__ == "__main__":
-    text = read_file("data/test1.txt")
-    info, err = add_document("test1_heading.txt", text, chunker=split_smart)
-    print("入库:", info, err)
+    # delete_document(7)
 
-    for name, did in [("固定长度", 4), ("按标题", info["id"] if info else None)]:
-        if did is None:
-            continue
-        rate, detail = hit_rate(did, k=3)
-        print(f"{name:8s} doc_id={did}  命中率={rate:.0%}  {detail}")
+    import time
+    for q in ["切片切多大合适", "top_k 取多少"]:
+        t = time.time()
+        print(f"\n--- {q} ---")
+        print(ask(q))
+        print(f"耗时: {time.time() - t:.2f}s")
