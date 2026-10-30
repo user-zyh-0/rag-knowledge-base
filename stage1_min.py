@@ -1,4 +1,5 @@
 import os
+
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -155,7 +156,7 @@ def embed(texts):
     return [item.embedding for item in resp.data]
 
 
-def retrieve(question, k = 3):
+def retrieve(question, k=3):
     qvec = embed([question])[0]
 
     with Session() as session:
@@ -175,7 +176,7 @@ def _tokenize(text):
     return [w for w in jieba.lcut_for_search(text) if w.strip()]
 
 
-def bm25_retrieve(question, k = 3):
+def bm25_retrieve(question, k=3):
     k1, b = 1.5,0.75
     q_tokens = _tokenize(question)
 
@@ -212,7 +213,7 @@ def bm25_retrieve(question, k = 3):
     return results[:k]
 
 
-def hybrid_retrieve(question, k = 3, pool=10, rrf_k=60):
+def hybrid_retrieve(question, k=3, pool=10, rrf_k=60):
     # pool 应远小于语料规模（生产 50~100）；本项目仅 10 块，pool=全量，
     # 融合退化为名次平均，区分度有限——机制正确，收益需更大语料才能体现
 
@@ -226,6 +227,46 @@ def hybrid_retrieve(question, k = 3, pool=10, rrf_k=60):
     for rank, (_, cid, content) in enumerate(bm25_hits, 1):
         scores[cid] = scores.get(cid, 0) + 1 / (rrf_k + rank)
         contents[cid] = content
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [(score, cid, contents[cid]) for cid, score in ranked[:k]]
+
+
+CORPUS_HINT = """资料是一份后端与 AI 学习笔记，涉及：HTTP 状态码、数据库表结构、SQLite 类型严格性、
+RAG 完整链路、切分参数（chunk_size / chunk_overlap）、检索参数（top_k / 相似度阈值）、
+Python 可变默认参数、算法练习、开发工具记录。"""
+
+
+def rewrite_query(question,n=2):
+    prompt = f"""资料主题：{CORPUS_HINT}
+
+把下面的用户问题改写成 {n} 个**用于检索的关键词组合**，要求：
+1. 输出关键词或短语，**不要写成完整问句**，去掉"多少/怎么/如何/咋/吗"这类疑问词
+2. **必须使用资料主题里出现过的术语**，不要用同义词替换
+3. 每行一个，不要编号、不要解释
+
+用户问题：{question}
+"""
+
+
+    resp = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = resp.choices[0].message.content
+    return [line.strip() for line in text.split("\n") if line.strip()][:n]
+
+
+def multi_retrieve(question, k=5, n = 2):
+    queries = [question] + rewrite_query(question,n)
+
+    scores = {}
+    contents = {}
+    for q in queries:
+        hits = hybrid_retrieve(q, k=k)
+        for rank, (_, cid, content) in enumerate(hits, 1):
+            scores[cid] = scores.get(cid, 0) + 1 / (60 + rank)
+            contents[cid] = content
+
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [(score, cid, contents[cid]) for cid, score in ranked[:k]]
 
@@ -286,6 +327,7 @@ def ask_stream(question, k=5):
 
 
 if __name__ == '__main__':
-    print(ask("400 是什么意思"))
-    print(ask("怎么防止模型乱编"))
-    print(ask("top_k 取多少"))
+    for q in ["切片切多大合适", "这玩意儿咋配", "top_k 取多少"]:
+        print(f"\n--- {q} ---")
+        print("融合:", [(cid, round(s, 4)) for s, cid, _ in hybrid_retrieve(q, 5)])
+        print("多路:", [(cid, round(s, 4)) for s, cid, _ in multi_retrieve(q, 5)])
