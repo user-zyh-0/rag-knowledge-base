@@ -14,6 +14,8 @@ import jieba
 import math
 from collections import Counter
 
+import uuid
+
 load_dotenv(override=True)
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
@@ -54,7 +56,63 @@ class Document(Base):
 
     chunks = relationship("Chunk", cascade="all, delete-orphan", passive_deletes=True)
 
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
 Session = sessionmaker(bind=engine)
+
+
+def add_message(session_id, role, content):
+    with Session() as session:
+        session.add(Message(session_id=session_id, role=role, content=content))
+        session.commit()
+
+
+def get_history(session_id, limit=6):
+    with Session() as session:
+        rows = (session.query(Message)
+                .filter(Message.session_id == session_id)
+                .order_by(Message.id.desc())
+                .limit(limit)
+                .all())
+        return [{"role": r.role, "content": r.content} for r in rows[::-1]]
+
+
+def rewrite_with_history(question, history, limit=3):
+    if not history:
+        return question
+
+    hist_text = ""
+    for m in history[-limit:]:
+        role = "用户" if m["role"] == "user" else "助手"
+        hist_text += f"{role}: {m['content']}\n"
+
+    prompt = f"""下面是之前的对话：
+{hist_text}
+用户的当前问题：{question}
+
+把当前问题改写成一个完整独立的问题。规则：
+1. 只做两件事：把代词换成具体名词、把省略的部分补上
+2. 禁止扩展问题范围。例：历史在聊 chunk_size 时，"那 top_k 呢？" 只能写成 "top_k 是多少？"，
+    绝不能写成 "top_k 和 chunk_size 有什么关系？"
+3. 问题已经完整就原样返回
+4. 改写结果不超过原问题的 2 倍长度
+5. 只输出改写后的问题，不要解释
+
+改写后的问题：
+"""
+    resp = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.choices[0].message.content.strip()
 
 
 def cosine(a,b):
@@ -379,12 +437,100 @@ def ask_stream(question, k=5):
             yield delta.content
 
 
-if __name__ == "__main__":
-    # delete_document(7)
+def ask_chat(question, session_id=None, k=5):
+    if session_id is None:
+        session_id = str(uuid.uuid4())
 
-    import time
-    for q in ["切片切多大合适", "top_k 取多少"]:
-        t = time.time()
-        print(f"\n--- {q} ---")
-        print(ask(q))
-        print(f"耗时: {time.time() - t:.2f}s")
+    history = get_history(session_id, limit=6)
+    standalone = rewrite_with_history(question, history)
+    hits = hybrid_retrieve(standalone, k=k)
+    print("  [独立问题]", standalone)
+    print("  [命中的块]", [cid for _, cid, _ in hits])
+
+    hist_section = ""
+    if history:
+        hist_text = ""
+        for m in history[-4:]:
+            role = "用户" if m["role"] == "user" else "助手"
+            hist_text += f"{role}: {m['content']}\n"
+        hist_section = f"之前的对话: \n{hist_text}\n"
+
+    context = ""
+    for i, (score, cid, content) in enumerate(hits, 1):
+        context += f"【资料{i}】{content}\n"
+
+    prompt = f"""请根据以下资料回答问题，只使用资料中的信息，不要编造。
+如果资料中没有相关内容，请回答"资料中没有提到"。
+如果资料中涉及多个不同的含义或场景，请分别说明，不要只答一个。
+
+{hist_section}资料：
+{context}
+
+问题：{question}
+"""
+    resp = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    answer = resp.choices[0].message.content
+
+    add_message(session_id, "user", question)
+    add_message(session_id, "assistant", answer)
+
+    return {"session_id": session_id, "answer": answer, "standalone": standalone}
+
+
+def ask_stream_chat(question, session_id=None, k=5):
+    history = get_history(session_id, limit=6)
+    standalone = rewrite_with_history(question, history)
+    hits = hybrid_retrieve(standalone, k=k)
+
+    hist_section = ""
+    if history:
+        hist_text = ""
+        for m in history[-4:]:
+            role = "用户" if m["role"] == "user" else "助手"
+            hist_text += f"{role}: {m['content']}\n"
+        hist_section = f"之前的对话: \n{hist_text}\n"
+
+    context = ""
+    for i, (score, cid, content) in enumerate(hits, 1):
+        context += f"【资料{i}】{content}\n"
+
+    prompt = f"""请根据以下资料回答问题，只使用资料中的信息，不要编造。
+如果资料中没有相关内容，请回答"资料中没有提到"。
+如果资料中涉及多个不同的含义或场景，请分别说明，不要只答一个。
+
+{hist_section}资料：
+{context}
+
+问题：{question}
+"""
+
+    stream = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True
+    )
+
+    full = ""
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        if getattr(delta, "reasoning_content", None):
+            yield delta.reasoning_content
+        if delta.content:
+            full += delta.content
+            yield delta.content
+
+    add_message(session_id, "user", question)
+    add_message(session_id, "assistant", full)
+
+if __name__ == "__main__":
+    sid = None
+    for q in ["chunk_size 是多少？", "它跟 overlap 什么关系？", "那 top_k 呢？"]:
+        r = ask_chat(q, sid)
+        sid = r["session_id"]
+        print(f"\n【问】{q}")
+        print(f"【独立问题】{r['standalone']}")
+        print(f"【答】{r['answer'][:120]}...")
+        print("-" * 60)
