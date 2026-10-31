@@ -533,7 +533,4 @@ if __name__ == "__main__":
     for q in ["chunk_size 是多少？", "它跟 overlap 什么关系？", "那 top_k 呢？"]:
         r = ask_chat(q, sid)
         sid = r["session_id"]
-        print(f"\n【问】{q}")
-        print(f"【独立问题】{r['standalone']}")
-        print(f"【答】{r['answer'][:120]}...")
-        print("-" * 60)
+        print(f"\n【问】{q}\n【独立问题】{r['standalone']}\n【答】{r['answer'][:120]}...")
