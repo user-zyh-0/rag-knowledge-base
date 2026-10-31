@@ -3,10 +3,8 @@ from pydantic import BaseModel, Field
 import uvicorn
 import uuid
 
-from sqlalchemy.dialects.mysql import limit
-
 from stage1_min import (add_document, list_documents, delete_document,
-                        ask, ask_stream, ask_chat, ask_stream_chat, get_history)
+                        ask_chat, ask_stream_chat, get_history)
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="RAG 知识库")
@@ -55,7 +53,7 @@ def chat_stream(payload: ChatRequest):
     return StreamingResponse(
         ask_stream_chat(payload.question,session_id, payload.k),
         media_type="text/plain; charset=utf-8",
-        headers={"X-session-Id": session_id}
+        headers={"X-Session-Id": session_id}
     )
 
 
