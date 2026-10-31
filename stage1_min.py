@@ -481,6 +481,9 @@ def ask_chat(question, session_id=None, k=5):
 
 
 def ask_stream_chat(question, session_id=None, k=5):
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+
     history = get_history(session_id, limit=6)
     standalone = rewrite_with_history(question, history)
     hits = hybrid_retrieve(standalone, k=k)
