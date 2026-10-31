@@ -135,7 +135,7 @@ def add_document(filename, text, chunker=None):
             return None, f"文档已存在: {filename}"
 
     # chunks = split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-    chunks = chunker(text) if chunker else split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    chunks = chunker(text) if chunker else split_smart(text, CHUNK_SIZE, CHUNK_OVERLAP)
     vecs = embed(chunks)
     size_bytes = len(text.encode("utf-8"))
     created_at = datetime.now()
