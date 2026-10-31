@@ -6,3 +6,6 @@ __pycache__/
 rag.db
 chroma_db/
 data/*.pdf
+
+# 本地测试文件（curl 用的请求体）
+body.json
